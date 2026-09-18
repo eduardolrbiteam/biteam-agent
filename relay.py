@@ -47,7 +47,7 @@ class WaveshareRelay:
         estado_actual = self.leer_canales(count=canal + 1)[canal]
         self.set_canal(canal, not estado_actual)
 
-    def set_todos(self, estado, count=NUM_CANALES, stagger_seconds=0.4):
+    def set_todos(self, estado, count=NUM_CANALES, stagger_seconds=5):
         """Enciende o apaga todos los canales usados. Al ENCENDER, uno por uno con una
         pequena pausa entre cada uno (evita el pico de corriente de arranque de tener
         26 extractores arrancando todos al mismo instante). Al apagar no hay ese riesgo,
