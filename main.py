@@ -3,6 +3,7 @@ import concurrent.futures
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 
@@ -689,6 +690,47 @@ async def modbus_status_loop():
         await asyncio.sleep(MODBUS_STATUS_INTERVAL_SECONDS)
 
 
+def _download_update(repo, tag, dest_path):
+    """Descarga el .exe publicado como asset del release {tag} en {repo} (repo publico
+    de GitHub, sin necesitar token). Verifica que el tamano descargado coincida con el
+    anunciado por el servidor y que sea de un tamano razonable (un exe real pesa varios
+    MB) antes de darlo por bueno - mejor fallar aqui que dejar un .exe corrupto listo
+    para reemplazar al que si funciona."""
+    url = f"https://github.com/{repo}/releases/download/{tag}/AgenteStart.exe"
+    resp = requests.get(url, timeout=60, stream=True)
+    resp.raise_for_status()
+    expected_size = int(resp.headers.get("Content-Length") or 0)
+    written = 0
+    with open(dest_path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=1024 * 256):
+            f.write(chunk)
+            written += len(chunk)
+    if expected_size and written != expected_size:
+        raise IOError(f"Descarga incompleta: {written}/{expected_size} bytes")
+    if written < 1_000_000:
+        raise IOError(f"Archivo descargado demasiado chico ({written} bytes) - no parece un .exe real")
+    return written
+
+
+def _apply_update_and_relaunch(new_exe_path):
+    """Un .exe no se puede reemplazar a si mismo mientras esta corriendo en Windows -
+    se lanza un .bat aparte (proceso independiente) que espera a que este proceso
+    termine, hace el reemplazo, relanza el agente, y se autoborra."""
+    current_exe = os.path.abspath(sys.argv[0])
+    exe_dir = os.path.dirname(current_exe)
+    bat_path = os.path.join(exe_dir, "_apply_update.bat")
+    bat_contents = (
+        "@echo off\r\n"
+        "timeout /t 2 /nobreak > nul\r\n"
+        f'move /y "{new_exe_path}" "{current_exe}"\r\n'
+        f'start "" "{current_exe}"\r\n'
+        'del "%~f0"\r\n'
+    )
+    with open(bat_path, "w") as f:
+        f.write(bat_contents)
+    subprocess.Popen(["cmd", "/c", bat_path], creationflags=subprocess.CREATE_NEW_CONSOLE)
+
+
 async def command_loop():
     while True:
         relay = RELAY_STATE["obj"]
@@ -721,6 +763,53 @@ async def command_loop():
                     )
                 except Exception as e:
                     log(f"Error confirmando comando {cmd['id']}: {e}")
+                continue
+
+            if cmd["action"] == "update_agent":
+                # No depende del rele ni de nada mas - se puede pedir en cualquier
+                # momento. Si algo falla en la descarga/verificacion, el agente actual
+                # sigue corriendo sin tocarse (nunca se llega a reemplazar el .exe).
+                # Un solo punto de salida "normal" (manda el ack y continue) para
+                # cualquier caso que no sea el exito, que sale por su cuenta con
+                # os._exit despues de reiniciar.
+                ready_to_relaunch = None  # se llena con tmp_path solo si la descarga salio bien
+
+                if sys.platform != "win32" or not getattr(sys, "frozen", False):
+                    status, result = "failed", "Auto-actualizacion solo soportada en el .exe compilado de Windows"
+                    log(f"Comando {cmd['id']} (update_agent): {result}")
+                else:
+                    repo = cmd["params"]["repo"]
+                    tag = cmd["params"]["tag"]
+                    tmp_path = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), f"_update_{tag}.exe")
+                    try:
+                        size = await asyncio.to_thread(_download_update, repo, tag, tmp_path)
+                        log(f"Comando {cmd['id']} (update_agent {tag}): descarga OK ({size} bytes)")
+                        result = f"Actualizando a {tag} y reiniciando..."
+                        ready_to_relaunch = tmp_path
+                    except Exception as e:
+                        status, result = "failed", str(e)
+                        log(f"Error descargando actualizacion {tag} (comando {cmd['id']}): {e}")
+                        try:
+                            if os.path.exists(tmp_path):
+                                os.remove(tmp_path)
+                        except OSError:
+                            pass
+
+                try:
+                    requests.post(
+                        f"{API_BASE}/agent/commands/{cmd['id']}/ack",
+                        json={"status": status, "result": result},
+                        headers=HEADERS, timeout=10,
+                    )
+                except Exception as e:
+                    log(f"Error confirmando comando {cmd['id']}: {e}")
+
+                if ready_to_relaunch:
+                    # Se manda el ack ANTES de reiniciar - una vez que el proceso se
+                    # cierra ya no puede confirmar nada.
+                    log(f"Aplicando actualizacion {tag} y reiniciando...")
+                    _apply_update_and_relaunch(ready_to_relaunch)
+                    os._exit(0)
                 continue
 
             if cmd["action"] == "reboot_miner":
