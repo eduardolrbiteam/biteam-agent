@@ -1,0 +1,3 @@
+pyasic
+pymodbus
+requests

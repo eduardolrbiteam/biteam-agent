@@ -1,0 +1,18 @@
+[Unit]
+Description=BiTeam ERP - Mining Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Ajusta User/WorkingDirectory si el binario vive en otro lado - por defecto se
+# instala en /home/pi/biteam-agent/ (junto con agent.log y agent.lock, que el propio
+# agente escribe ahi al arrancar).
+User=pi
+WorkingDirectory=/home/pi/biteam-agent
+ExecStart=/home/pi/biteam-agent/biteam-agent
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
