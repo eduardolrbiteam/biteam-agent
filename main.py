@@ -11,6 +11,8 @@ from single_instance import ensure_single_instance
 ensure_single_instance()
 
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "agent.log")
+UPDATE_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "actualizaciones.log")
+UPDATE_MARKER_FILE = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "_update_marker.txt")
 
 # pyasic reporta por WARNING cada IP del rango que no tiene minero (normal, no es un
 # error). logging.disable() lo bloquea a nivel global sin importar que logger interno
@@ -44,7 +46,7 @@ from config import (
 # central sin que eso duplique la mina - ver get_current_agent() en la API.
 # Se sube a mano en cada release (ver tag de git) - el ERP la compara contra
 # AGENT_LATEST_VERSION para avisar si un agente quedo desactualizado.
-AGENT_VERSION = "v1.2.2"
+AGENT_VERSION = "v1.2.3"
 
 HEADERS = {
     "X-Client-Id": CLIENT_ID, "X-Api-Key": AGENT_API_KEY,
@@ -58,6 +60,18 @@ def log(msg):
     line = f"[{time.strftime('%H:%M:%S')}] {msg}"
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def log_update(msg):
+    # Igual que log(), pero ademas escribe en un archivo aparte solo de actualizaciones
+    # (agent.log se llena rapido de lineas de escaneo y es dificil de leer para esto).
+    log(msg)
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    try:
+        with open(UPDATE_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except OSError:
         pass
@@ -812,19 +826,20 @@ async def command_loop():
 
                 if sys.platform != "win32" or not getattr(sys, "frozen", False):
                     status, result = "failed", "Auto-actualizacion solo soportada en el .exe compilado de Windows"
-                    log(f"Comando {cmd['id']} (update_agent): {result}")
+                    log_update(f"Comando {cmd['id']}: {result}")
                 else:
                     repo = cmd["params"]["repo"]
                     tag = cmd["params"]["tag"]
                     tmp_path = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), f"_update_{tag}.exe")
+                    log_update(f"Comando {cmd['id']}: version actual {AGENT_VERSION}, actualizando a {tag}...")
                     try:
                         size = await asyncio.to_thread(_download_update, repo, tag, tmp_path)
-                        log(f"Comando {cmd['id']} (update_agent {tag}): descarga OK ({size} bytes)")
+                        log_update(f"Comando {cmd['id']}: descarga de {tag} OK ({size} bytes)")
                         result = f"Actualizando a {tag} y reiniciando..."
                         ready_to_relaunch = tmp_path
                     except Exception as e:
                         status, result = "failed", str(e)
-                        log(f"Error descargando actualizacion {tag} (comando {cmd['id']}): {e}")
+                        log_update(f"Comando {cmd['id']}: fallo la descarga de {tag} - {e}")
                         try:
                             if os.path.exists(tmp_path):
                                 os.remove(tmp_path)
@@ -843,7 +858,12 @@ async def command_loop():
                 if ready_to_relaunch:
                     # Se manda el ack ANTES de reiniciar - una vez que el proceso se
                     # cierra ya no puede confirmar nada.
-                    log(f"Aplicando actualizacion {tag} y reiniciando...")
+                    log_update(f"Comando {cmd['id']}: aplicando actualizacion a {tag} y reiniciando...")
+                    try:
+                        with open(UPDATE_MARKER_FILE, "w", encoding="utf-8") as f:
+                            f.write(tag)
+                    except OSError:
+                        pass
                     _apply_update_and_relaunch(ready_to_relaunch)
                     os._exit(0)
                 continue
@@ -953,6 +973,20 @@ def _report_location():
 
 async def main():
     log(f"Agente iniciado. Nombre={AGENT_NAME} Client ID={CLIENT_ID} API_BASE={API_BASE}")
+    if os.path.exists(UPDATE_MARKER_FILE):
+        try:
+            with open(UPDATE_MARKER_FILE, "r", encoding="utf-8") as f:
+                expected_tag = f.read().strip()
+        except OSError:
+            expected_tag = None
+        if expected_tag and expected_tag == AGENT_VERSION:
+            log_update(f"Actualizacion a {expected_tag} completada - agente reinicio correctamente.")
+        elif expected_tag:
+            log_update(f"Se esperaba quedar en {expected_tag} pero el agente arranco en {AGENT_VERSION} - revisar.")
+        try:
+            os.remove(UPDATE_MARKER_FILE)
+        except OSError:
+            pass
     await asyncio.to_thread(_report_location)
     # El rele ya no se conecta al arrancar: se resuelve dinamicamente desde el registro
     # de dispositivos Modbus de la mina (puede no haber ninguno todavia, o cambiar).
