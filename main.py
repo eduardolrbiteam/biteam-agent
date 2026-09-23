@@ -44,7 +44,7 @@ from config import (
 # central sin que eso duplique la mina - ver get_current_agent() en la API.
 # Se sube a mano en cada release (ver tag de git) - el ERP la compara contra
 # AGENT_LATEST_VERSION para avisar si un agente quedo desactualizado.
-AGENT_VERSION = "v1.2.1"
+AGENT_VERSION = "v1.2.2"
 
 HEADERS = {
     "X-Client-Id": CLIENT_ID, "X-Api-Key": AGENT_API_KEY,
@@ -719,26 +719,52 @@ def _download_update(repo, tag, dest_path):
 
 def _apply_update_and_relaunch(new_exe_path):
     """Un .exe no se puede reemplazar a si mismo mientras esta corriendo en Windows -
-    se lanza un .bat aparte (proceso independiente) que espera a que este proceso
-    termine, hace el reemplazo, relanza el agente, y se autoborra."""
+    se lanza un script de PowerShell aparte (proceso independiente) que espera a que
+    este proceso termine, hace el reemplazo, y relanza el agente.
+
+    En pruebas reales, el primer arranque tras el reemplazo a veces mostraba una
+    ventana de "Error" en vez de quedar corriendo normal (causa exacta aun sin
+    confirmar - no era Defender/SmartScreen, se descarto esa teoria). En vez de
+    perseguir la causa a ciegas, este script VERIFICA que de verdad haya quedado
+    corriendo bien (proceso vivo, sin ninguna ventana visible - un arranque sano de
+    este agente headless no tiene titulo de ventana) y, si no, cierra lo que haya
+    quedado atascado y reintenta, hasta 3 veces, antes de darse por vencido."""
     current_exe = os.path.abspath(sys.argv[0])
     exe_dir = os.path.dirname(current_exe)
-    bat_path = os.path.join(exe_dir, "_apply_update.bat")
-    bat_contents = (
-        "@echo off\r\n"
-        "timeout /t 2 /nobreak > nul\r\n"
-        f'move /y "{new_exe_path}" "{current_exe}"\r\n'
-        # Un .exe recien escrito/reemplazado a veces tarda unos segundos en "asentarse"
-        # con el antivirus/Defender antes de poder arrancar limpio (se vio en pruebas
-        # reales: arrancaba con una ventana de Error, pero el mismo .exe abria bien
-        # segundos despues sin tocarle nada) - este margen extra evita ese problema.
-        "timeout /t 5 /nobreak > nul\r\n"
-        f'start "" "{current_exe}"\r\n'
-        'del "%~f0"\r\n'
+    ps1_path = os.path.join(exe_dir, "_apply_update.ps1")
+    ps1_contents = f'''
+$exePath = "{current_exe}"
+Start-Sleep -Seconds 3
+Move-Item -Path "{new_exe_path}" -Destination $exePath -Force
+
+$success = $false
+for ($i = 0; $i -lt 3; $i++) {{
+    Get-Process -Name "Agente Start" -ErrorAction SilentlyContinue | Where-Object {{ $_.MainWindowTitle -ne "" }} | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Process -FilePath $exePath
+    Start-Sleep -Seconds 10
+    $procs = Get-Process -Name "Agente Start" -ErrorAction SilentlyContinue
+    $stuck = $procs | Where-Object {{ $_.MainWindowTitle -ne "" }}
+    $running = $procs | Where-Object {{ $_.MainWindowTitle -eq "" }}
+    if ($running -and -not $stuck) {{
+        $success = $true
+        break
+    }}
+    $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+}}
+
+if (-not $success) {{
+    # Ultimo intento aunque no se haya podido verificar - mejor que dejarlo apagado.
+    Start-Process -FilePath $exePath
+}}
+
+Remove-Item -Path $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
+'''
+    with open(ps1_path, "w") as f:
+        f.write(ps1_contents)
+    subprocess.Popen(
+        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", ps1_path],
+        creationflags=subprocess.CREATE_NO_WINDOW,
     )
-    with open(bat_path, "w") as f:
-        f.write(bat_contents)
-    subprocess.Popen(["cmd", "/c", bat_path], creationflags=subprocess.CREATE_NEW_CONSOLE)
 
 
 async def command_loop():
