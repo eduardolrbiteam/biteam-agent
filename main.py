@@ -44,7 +44,7 @@ from config import (
 # central sin que eso duplique la mina - ver get_current_agent() en la API.
 # Se sube a mano en cada release (ver tag de git) - el ERP la compara contra
 # AGENT_LATEST_VERSION para avisar si un agente quedo desactualizado.
-AGENT_VERSION = "v1.2.0"
+AGENT_VERSION = "v1.2.1"
 
 HEADERS = {
     "X-Client-Id": CLIENT_ID, "X-Api-Key": AGENT_API_KEY,
