@@ -96,9 +96,10 @@ def load_setup():
         agent_uid = f"{hostname}-{uuid.uuid4().hex[:6]}"
 
     if not agent_name:
-        # Nombre provisional hasta que lo renombren desde el programa central (pestana
-        # Agentes) - no se le pide al usuario aqui.
-        agent_name = f"Mina nueva {agent_uid[:8]}"
+        # El nombre de la PC (no un placeholder generico) - asi ya sale reconocible en
+        # la pestana Agentes sin tener que renombrarlo a mano. Se puede seguir
+        # renombrando despues desde ahi si se quiere otro nombre.
+        agent_name = platform.node() or f"Mina nueva {agent_uid[:8]}"
 
     _save_setup_file({
         "client_id": client_id, "api_key": api_key,

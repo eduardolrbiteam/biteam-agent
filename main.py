@@ -896,8 +896,28 @@ def _run_relay_command(relay, action, params):
         raise ValueError(f"accion desconocida: {action}")
 
 
+def _report_location():
+    """Geolocalizacion aproximada por IP publica (no GPS - una mini PC no trae eso). Se
+    manda una sola vez al arrancar, con fallo silencioso si no hay internet todavia o el
+    servicio de geolocalizacion no responde - no debe impedir que el agente arranque."""
+    try:
+        geo = requests.get("http://ip-api.com/json/", timeout=10).json()
+        if geo.get("status") != "success":
+            log(f"No se pudo obtener la ubicacion por IP: {geo.get('message')}")
+            return
+        payload = {
+            "latitude": geo["lat"], "longitude": geo["lon"],
+            "city": f"{geo.get('city', '')}, {geo.get('regionName', '')}, {geo.get('country', '')}".strip(", "),
+        }
+        requests.post(f"{API_BASE}/agent/location", json=payload, headers=HEADERS, timeout=10)
+        log(f"Ubicacion reportada (aproximada por IP): {payload['city']}")
+    except Exception as e:
+        log(f"Error reportando ubicacion: {e}")
+
+
 async def main():
     log(f"Agente iniciado. Nombre={AGENT_NAME} Client ID={CLIENT_ID} API_BASE={API_BASE}")
+    await asyncio.to_thread(_report_location)
     # El rele ya no se conecta al arrancar: se resuelve dinamicamente desde el registro
     # de dispositivos Modbus de la mina (puede no haber ninguno todavia, o cambiar).
     await asyncio.gather(ingest_loop(), command_loop(), modbus_status_loop())
