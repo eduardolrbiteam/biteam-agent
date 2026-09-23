@@ -46,7 +46,7 @@ from config import (
 # central sin que eso duplique la mina - ver get_current_agent() en la API.
 # Se sube a mano en cada release (ver tag de git) - el ERP la compara contra
 # AGENT_LATEST_VERSION para avisar si un agente quedo desactualizado.
-AGENT_VERSION = "v1.2.3"
+AGENT_VERSION = "v1.2.4"
 
 HEADERS = {
     "X-Client-Id": CLIENT_ID, "X-Api-Key": AGENT_API_KEY,
@@ -775,9 +775,14 @@ Remove-Item -Path $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyConti
 '''
     with open(ps1_path, "w") as f:
         f.write(ps1_contents)
+    # Sin esto el .exe nuevo hereda las variables internas de PyInstaller de este proceso,
+    # se cree "hijo" de el y busca su carpeta _MEI temporal (ya borrada) -> ventana "Error".
+    clean_env = {k: v for k, v in os.environ.items() if not k.startswith("_PYI_") and not k.startswith("_MEIPASS")}
+    clean_env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
     subprocess.Popen(
         ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", ps1_path],
         creationflags=subprocess.CREATE_NO_WINDOW,
+        env=clean_env,
     )
 
 
