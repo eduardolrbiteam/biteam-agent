@@ -42,9 +42,14 @@ from config import (
 # estilo Foreman). X-Agent-Uid es el identificador estable de ESTA instalacion (no
 # cambia nunca); X-Agent-Name es solo la etiqueta actual, renombrable desde el programa
 # central sin que eso duplique la mina - ver get_current_agent() en la API.
+# Se sube a mano en cada release (ver tag de git) - el ERP la compara contra
+# AGENT_LATEST_VERSION para avisar si un agente quedo desactualizado.
+AGENT_VERSION = "v1.2.0"
+
 HEADERS = {
     "X-Client-Id": CLIENT_ID, "X-Api-Key": AGENT_API_KEY,
     "X-Agent-Name": AGENT_NAME, "X-Agent-Uid": AGENT_UID,
+    "X-Agent-Version": AGENT_VERSION,
 }
 
 
@@ -723,6 +728,11 @@ def _apply_update_and_relaunch(new_exe_path):
         "@echo off\r\n"
         "timeout /t 2 /nobreak > nul\r\n"
         f'move /y "{new_exe_path}" "{current_exe}"\r\n'
+        # Un .exe recien escrito/reemplazado a veces tarda unos segundos en "asentarse"
+        # con el antivirus/Defender antes de poder arrancar limpio (se vio en pruebas
+        # reales: arrancaba con una ventana de Error, pero el mismo .exe abria bien
+        # segundos despues sin tocarle nada) - este margen extra evita ese problema.
+        "timeout /t 5 /nobreak > nul\r\n"
         f'start "" "{current_exe}"\r\n'
         'del "%~f0"\r\n'
     )
