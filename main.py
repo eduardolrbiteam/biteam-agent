@@ -5,6 +5,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 
 from single_instance import ensure_single_instance
@@ -31,6 +32,16 @@ settings.update("network_scan_semaphore", 150)
 settings.update("network_ping_timeout", 3)
 settings.update("factory_get_timeout", 3)
 
+MINER_DATA_TIMEOUT_SECONDS = 45
+NETWORK_SCAN_TIMEOUT_SECONDS = 180
+FULL_SCAN_TIMEOUT_SECONDS = 300
+# Ultima red de seguridad: si por cualquier otra razon no termina un ciclo de escaneo en
+# este tiempo (normal: ~30s), el agente se reinicia solo. Reiniciar solo lee el rele, no
+# escribe canales.
+SCAN_WATCHDOG_SECONDS = 15 * 60
+COMMAND_WATCHDOG_SECONDS = 10 * 60
+REBOOT_MINER_TIMEOUT_SECONDS = 60
+
 from pymodbus.client import ModbusTcpClient
 
 from relay import WaveshareRelay
@@ -46,7 +57,7 @@ from config import (
 # central sin que eso duplique la mina - ver get_current_agent() en la API.
 # Se sube a mano en cada release (ver tag de git) - el ERP la compara contra
 # AGENT_LATEST_VERSION para avisar si un agente quedo desactualizado.
-AGENT_VERSION = "v1.2.5"
+AGENT_VERSION = "v1.2.6"
 
 HEADERS = {
     "X-Client-Id": CLIENT_ID, "X-Api-Key": AGENT_API_KEY,
@@ -419,7 +430,10 @@ async def scan_all_miners():
 
     try:
         network = MinerNetwork.from_list(ips)
-        miners = await network.scan()
+        miners = await asyncio.wait_for(network.scan(), timeout=NETWORK_SCAN_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        log(f"El descubrimiento de mineros excedio {NETWORK_SCAN_TIMEOUT_SECONDS}s - se reintenta en el siguiente ciclo")
+        return []
     except Exception as e:
         log(f"Error escaneando: {e}")
         return []
@@ -457,7 +471,9 @@ async def scan_all_miners():
             return None
 
     async def fetch_one(miner):
-        data = await miner.get_data()
+        # Sin este limite, un minero que acepta la conexion pero nunca responde dejaba el
+        # ciclo completo esperando para siempre (paso con 192.168.17.175 el 2026-10-02).
+        data = await asyncio.wait_for(miner.get_data(), timeout=MINER_DATA_TIMEOUT_SECONDS)
         rpc = miner.rpc
         async with raw_calls_semaphore:
             if hasattr(rpc, "summary"):
@@ -479,16 +495,19 @@ async def scan_all_miners():
 
     miners_out = []
     for miner, result in zip(miners, results):
-        if isinstance(result, Exception):
-            log(f"Error leyendo datos de {getattr(miner, 'ip', '?')}: {result}")
+        if isinstance(result, BaseException):
+            log(f"Error leyendo datos de {getattr(miner, 'ip', '?')}: {type(result).__name__} {result}")
             continue
-        data, summary, psu, device_info, edevs_raw, pools_raw, setting = result
-        details = extract_raw_details(summary, psu, device_info, edevs_raw, pools_raw, setting)
-        miners_out.append(build_miner_dict(
-            rack_name_for_ip(data.ip), data,
-            extract_elapsed(summary), extract_psu_serial(psu, device_info),
-            details,
-        ))
+        try:
+            data, summary, psu, device_info, edevs_raw, pools_raw, setting = result
+            details = extract_raw_details(summary, psu, device_info, edevs_raw, pools_raw, setting)
+            miners_out.append(build_miner_dict(
+                rack_name_for_ip(data.ip), data,
+                extract_elapsed(summary), extract_psu_serial(psu, device_info),
+                details,
+            ))
+        except Exception as e:
+            log(f"Error procesando datos de {getattr(miner, 'ip', '?')}: {type(e).__name__} {e}")
 
     return miners_out
 
@@ -634,20 +653,77 @@ def post_ingest(miners, extractor_channels=None):
         log(f"Error subiendo datos a la API: {e}")
 
 
+_last_scan_cycle_at = time.monotonic()
+_last_command_loop_at = time.monotonic()
+# Solo un reinicio a la vez: la actualizacion y el vigilante no deben relanzar los dos.
+_relaunch_lock = threading.Lock()
+
+
+def _restart_reason():
+    scan_limit = max(SCAN_WATCHDOG_SECONDS, 2 * INGEST_INTERVAL_SECONDS + FULL_SCAN_TIMEOUT_SECONDS + 120)
+    scan_stalled = time.monotonic() - _last_scan_cycle_at
+    if scan_stalled > scan_limit:
+        return f"El escaneo no termina un ciclo hace {int(scan_stalled // 60)} min"
+    command_stalled = time.monotonic() - _last_command_loop_at
+    if command_stalled > COMMAND_WATCHDOG_SECONDS:
+        return f"El ciclo de ordenes (extractores) no avanza hace {int(command_stalled // 60)} min"
+    return None
+
+
+def _scan_watchdog():
+    # Hilo aparte (no una tarea de asyncio) para que funcione aunque el loop de eventos
+    # quedara bloqueado. Reiniciar solo lee el rele, nunca escribe canales.
+    while True:
+        time.sleep(60)
+        try:
+            reason = _restart_reason()
+            if reason is None or not _relaunch_lock.acquire(blocking=False):
+                continue
+            log_update(f"{reason} - reiniciando el agente.")
+            if sys.platform == "win32" and getattr(sys, "frozen", False):
+                try:
+                    _apply_update_and_relaunch()
+                except Exception as e:
+                    # Sin relanzador no se sale: el agente nunca debe quedar apagado.
+                    log_update(f"No se pudo programar el reinicio ({type(e).__name__}: {e}) - se reintenta en 1 min.")
+                    _relaunch_lock.release()
+                    continue
+            os._exit(1)
+        except Exception as e:
+            log(f"Error en el vigilante: {type(e).__name__} {e}")
+
+
 async def ingest_loop():
+    global _last_scan_cycle_at
     while True:
         start = time.monotonic()
-        miners = await scan_all_miners()
-        relay = refresh_relay()
+        try:
+            # El rele se resuelve antes del escaneo: tras un arranque, o si el escaneo se
+            # pasa del limite, las ordenes de extractores no tienen que esperarlo.
+            relay = refresh_relay()
+            scan_ok = True
+            try:
+                miners = await asyncio.wait_for(scan_all_miners(), timeout=FULL_SCAN_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                # Se sigue reportando el estado de los extractores; la lista vacia no marca
+                # mineros como caidos (el backend solo actualiza las IPs que llegan).
+                log(f"El escaneo excedio {FULL_SCAN_TIMEOUT_SECONDS}s - este ciclo solo se reportan los extractores")
+                miners, scan_ok = [], False
 
-        by_rack = {}
-        for m in miners:
-            by_rack.setdefault(m["rack"], []).append(m)
-        for rack_name in sorted(by_rack):
-            log(f"  {rack_name}: {len(by_rack[rack_name])} mineros")
+            by_rack = {}
+            for m in miners:
+                by_rack.setdefault(m["rack"], []).append(m)
+            for rack_name in sorted(by_rack):
+                log(f"  {rack_name}: {len(by_rack[rack_name])} mineros")
 
-        post_ingest(miners, extractor_channels=read_extractor_channels(relay))
-        log(f"Ciclo completo: {len(miners)} mineros en {time.monotonic() - start:.1f}s")
+            post_ingest(miners, extractor_channels=read_extractor_channels(relay))
+            if scan_ok:
+                log(f"Ciclo completo: {len(miners)} mineros en {time.monotonic() - start:.1f}s")
+                _last_scan_cycle_at = time.monotonic()
+        except Exception as e:
+            # No se actualiza _last_scan_cycle_at: si todos los ciclos fallan, el vigilante
+            # reinicia el agente.
+            log(f"Error inesperado en el ciclo de escaneo: {type(e).__name__} {e}")
 
         elapsed = time.monotonic() - start
         await asyncio.sleep(max(0, INGEST_INTERVAL_SECONDS - elapsed))
@@ -731,25 +807,19 @@ def _download_update(repo, tag, dest_path):
     return written
 
 
-def _apply_update_and_relaunch(new_exe_path):
+def _apply_update_and_relaunch(new_exe_path=None):
     """Un .exe no se puede reemplazar a si mismo mientras esta corriendo en Windows -
-    se lanza un script de PowerShell aparte (proceso independiente) que espera a que
-    este proceso termine, hace el reemplazo, y relanza el agente.
-
-    En pruebas reales, el primer arranque tras el reemplazo a veces mostraba una
-    ventana de "Error" en vez de quedar corriendo normal (causa exacta aun sin
-    confirmar - no era Defender/SmartScreen, se descarto esa teoria). En vez de
-    perseguir la causa a ciegas, este script VERIFICA que de verdad haya quedado
-    corriendo bien (proceso vivo, sin ninguna ventana visible - un arranque sano de
-    este agente headless no tiene titulo de ventana) y, si no, cierra lo que haya
-    quedado atascado y reintenta, hasta 3 veces, antes de darse por vencido."""
+    se lanza un script de PowerShell aparte que espera a que este proceso termine, hace
+    el reemplazo (si hay new_exe_path; sin el es solo un reinicio) y relanza el agente,
+    verificando que quede corriendo sin ventana atascada (hasta 3 intentos)."""
     current_exe = os.path.abspath(sys.argv[0])
     exe_dir = os.path.dirname(current_exe)
     ps1_path = os.path.join(exe_dir, "_apply_update.ps1")
+    move_line = f'Move-Item -Path "{new_exe_path}" -Destination $exePath -Force' if new_exe_path else ""
     ps1_contents = f'''
 $exePath = "{current_exe}"
 Start-Sleep -Seconds 3
-Move-Item -Path "{new_exe_path}" -Destination $exePath -Force
+{move_line}
 
 $success = $false
 for ($i = 0; $i -lt 3; $i++) {{
@@ -786,9 +856,146 @@ Remove-Item -Path $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyConti
     )
 
 
+def _ack(command_id, status, result):
+    try:
+        requests.post(
+            f"{API_BASE}/agent/commands/{command_id}/ack",
+            json={"status": status, "result": result},
+            headers=HEADERS, timeout=10,
+        )
+    except Exception as e:
+        log(f"Error confirmando comando {command_id}: {e}")
+
+
+async def _reboot_one_miner(ip):
+    network = MinerNetwork.from_list([ip])
+    miners = await network.scan()
+    if not miners:
+        return "failed", f"No se pudo conectar al minero en {ip}"
+    await miners[0].reboot()
+    return "done", f"Reinicio enviado a {ip}"
+
+
+async def _process_command(cmd):
+    status, result = "done", None
+    if cmd["action"] == "discover_modbus":
+        # No requiere que ya haya un rele registrado (es justo para encontrar
+        # uno nuevo) - se corre en un thread aparte para no congelar el resto
+        # del agente (escaneo de mineros, etc.) mientras dura la busqueda.
+        try:
+            devices = await asyncio.to_thread(discover_modbus_devices, cmd["params"]["range"])
+            result = json.dumps(devices)
+            log(f"Comando {cmd['id']} (discover_modbus): {len(devices)} dispositivo(s) encontrado(s)")
+        except Exception as e:
+            status, result = "failed", str(e)
+            log(f"Error ejecutando comando {cmd['id']}: {e}")
+        _ack(cmd["id"], status, result)
+        return
+
+    if cmd["action"] == "update_agent":
+        # No depende del rele ni de nada mas - se puede pedir en cualquier
+        # momento. Si algo falla en la descarga/verificacion, el agente actual
+        # sigue corriendo sin tocarse (nunca se llega a reemplazar el .exe).
+        ready_to_relaunch = None  # se llena con tmp_path solo si la descarga salio bien
+        tag = None
+
+        if sys.platform != "win32" or not getattr(sys, "frozen", False):
+            status, result = "failed", "Auto-actualizacion solo soportada en el .exe compilado de Windows"
+            log_update(f"Comando {cmd['id']}: {result}")
+        else:
+            repo = cmd["params"]["repo"]
+            tag = cmd["params"]["tag"]
+            tmp_path = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), f"_update_{tag}.exe")
+            log_update(f"Comando {cmd['id']}: version actual {AGENT_VERSION}, actualizando a {tag}...")
+            try:
+                size = await asyncio.to_thread(_download_update, repo, tag, tmp_path)
+                log_update(f"Comando {cmd['id']}: descarga de {tag} OK ({size} bytes)")
+                result = f"Actualizando a {tag} y reiniciando..."
+                ready_to_relaunch = tmp_path
+            except Exception as e:
+                status, result = "failed", str(e)
+                log_update(f"Comando {cmd['id']}: fallo la descarga de {tag} - {e}")
+                try:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except OSError:
+                    pass
+
+        if ready_to_relaunch:
+            # Si el vigilante ya esta reiniciando el agente, no se confirma: el comando
+            # queda pendiente y se vuelve a intentar despues del reinicio.
+            _relaunch_lock.acquire()
+        # Se manda el ack ANTES de reiniciar - una vez que el proceso se cierra ya no
+        # puede confirmar nada.
+        _ack(cmd["id"], status, result)
+
+        if ready_to_relaunch:
+            log_update(f"Comando {cmd['id']}: aplicando actualizacion a {tag} y reiniciando...")
+            try:
+                with open(UPDATE_MARKER_FILE, "w", encoding="utf-8") as f:
+                    f.write(tag)
+            except OSError:
+                pass
+            _apply_update_and_relaunch(ready_to_relaunch)
+            os._exit(0)
+        return
+
+    if cmd["action"] == "reboot_miner":
+        # No depende del rele de extractores - se conecta directo a ese minero
+        # puntual (mismo mecanismo pyasic que usa el escaneo normal) y le pide
+        # reiniciar. Lo emite el monitoreo de IA del backend (ver
+        # api/app/services/ai_monitor.py) tras varios ciclos de anomalia.
+        # pyasic no pone limite de tiempo en el reinicio de Whatsminer V3: un minero que
+        # acepta la conexion y no responde dejaria trabadas todas las ordenes.
+        ip = cmd["params"]["ip"]
+        try:
+            status, result = await asyncio.wait_for(_reboot_one_miner(ip), timeout=REBOOT_MINER_TIMEOUT_SECONDS)
+            log(f"Comando {cmd['id']} (reboot_miner {ip}): {status}")
+        except asyncio.TimeoutError:
+            status, result = "failed", f"El minero {ip} no respondio en {REBOOT_MINER_TIMEOUT_SECONDS}s (puede o no haber reiniciado)"
+            log(f"Comando {cmd['id']} (reboot_miner {ip}): sin respuesta en {REBOOT_MINER_TIMEOUT_SECONDS}s")
+        except Exception as e:
+            status, result = "failed", str(e)
+            log(f"Error ejecutando comando {cmd['id']} (reboot_miner {ip}): {e}")
+        _ack(cmd["id"], status, result)
+        return
+
+    relay = RELAY_STATE["obj"]
+    if relay is None and cmd["action"] in ("extractor_set_channel", "extractor_set_all"):
+        relay = refresh_relay()
+    if relay is not None:
+        ensure_connected(relay)
+    try:
+        if relay is None:
+            status, result = "failed", "No hay un rele de extractores registrado para esta mina"
+        elif cmd["action"] in ("extractor_set_channel", "extractor_set_all"):
+            try:
+                _run_relay_command(relay, cmd["action"], cmd["params"])
+            except Exception as first_err:
+                # pymodbus no siempre detecta que el rele cerro la conexion de su
+                # lado (ej. WinError 10054) hasta que se intenta escribir -
+                # is_connected() puede seguir diciendo "conectado" con un socket
+                # ya muerto. Se fuerza una reconexion real y se reintenta una vez
+                # antes de rendirse, en vez de dejar el rele en un estado roto
+                # hasta el siguiente ciclo de ingest.
+                log(f"Comando {cmd['id']}: fallo inicial ({first_err}), forzando reconexion al rele...")
+                relay.close()
+                relay.connect()
+                _run_relay_command(relay, cmd["action"], cmd["params"])
+        else:
+            status, result = "failed", f"accion desconocida: {cmd['action']}"
+        log(f"Comando {cmd['id']} ({cmd['action']}) ejecutado: {status}")
+    except Exception as e:
+        status, result = "failed", str(e)
+        log(f"Error ejecutando comando {cmd['id']}: {e}")
+
+    _ack(cmd["id"], status, result)
+
+
 async def command_loop():
+    global _last_command_loop_at
     while True:
-        relay = RELAY_STATE["obj"]
+        _last_command_loop_at = time.monotonic()
         try:
             resp = requests.get(f"{API_BASE}/agent/commands/pending", headers=HEADERS, timeout=10)
             resp.raise_for_status()
@@ -798,143 +1005,15 @@ async def command_loop():
             commands = []
 
         for cmd in commands:
-            status, result = "done", None
-            if cmd["action"] == "discover_modbus":
-                # No requiere que ya haya un rele registrado (es justo para encontrar
-                # uno nuevo) - se corre en un thread aparte para no congelar el resto
-                # del agente (escaneo de mineros, etc.) mientras dura la busqueda.
-                try:
-                    devices = await asyncio.to_thread(discover_modbus_devices, cmd["params"]["range"])
-                    result = json.dumps(devices)
-                    log(f"Comando {cmd['id']} (discover_modbus): {len(devices)} dispositivo(s) encontrado(s)")
-                except Exception as e:
-                    status, result = "failed", str(e)
-                    log(f"Error ejecutando comando {cmd['id']}: {e}")
-                try:
-                    requests.post(
-                        f"{API_BASE}/agent/commands/{cmd['id']}/ack",
-                        json={"status": status, "result": result},
-                        headers=HEADERS, timeout=10,
-                    )
-                except Exception as e:
-                    log(f"Error confirmando comando {cmd['id']}: {e}")
-                continue
-
-            if cmd["action"] == "update_agent":
-                # No depende del rele ni de nada mas - se puede pedir en cualquier
-                # momento. Si algo falla en la descarga/verificacion, el agente actual
-                # sigue corriendo sin tocarse (nunca se llega a reemplazar el .exe).
-                # Un solo punto de salida "normal" (manda el ack y continue) para
-                # cualquier caso que no sea el exito, que sale por su cuenta con
-                # os._exit despues de reiniciar.
-                ready_to_relaunch = None  # se llena con tmp_path solo si la descarga salio bien
-
-                if sys.platform != "win32" or not getattr(sys, "frozen", False):
-                    status, result = "failed", "Auto-actualizacion solo soportada en el .exe compilado de Windows"
-                    log_update(f"Comando {cmd['id']}: {result}")
-                else:
-                    repo = cmd["params"]["repo"]
-                    tag = cmd["params"]["tag"]
-                    tmp_path = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), f"_update_{tag}.exe")
-                    log_update(f"Comando {cmd['id']}: version actual {AGENT_VERSION}, actualizando a {tag}...")
-                    try:
-                        size = await asyncio.to_thread(_download_update, repo, tag, tmp_path)
-                        log_update(f"Comando {cmd['id']}: descarga de {tag} OK ({size} bytes)")
-                        result = f"Actualizando a {tag} y reiniciando..."
-                        ready_to_relaunch = tmp_path
-                    except Exception as e:
-                        status, result = "failed", str(e)
-                        log_update(f"Comando {cmd['id']}: fallo la descarga de {tag} - {e}")
-                        try:
-                            if os.path.exists(tmp_path):
-                                os.remove(tmp_path)
-                        except OSError:
-                            pass
-
-                try:
-                    requests.post(
-                        f"{API_BASE}/agent/commands/{cmd['id']}/ack",
-                        json={"status": status, "result": result},
-                        headers=HEADERS, timeout=10,
-                    )
-                except Exception as e:
-                    log(f"Error confirmando comando {cmd['id']}: {e}")
-
-                if ready_to_relaunch:
-                    # Se manda el ack ANTES de reiniciar - una vez que el proceso se
-                    # cierra ya no puede confirmar nada.
-                    log_update(f"Comando {cmd['id']}: aplicando actualizacion a {tag} y reiniciando...")
-                    try:
-                        with open(UPDATE_MARKER_FILE, "w", encoding="utf-8") as f:
-                            f.write(tag)
-                    except OSError:
-                        pass
-                    _apply_update_and_relaunch(ready_to_relaunch)
-                    os._exit(0)
-                continue
-
-            if cmd["action"] == "reboot_miner":
-                # No depende del rele de extractores - se conecta directo a ese minero
-                # puntual (mismo mecanismo pyasic que usa el escaneo normal) y le pide
-                # reiniciar. Lo emite el monitoreo de IA del backend (ver
-                # api/app/services/ai_monitor.py) tras varios ciclos de anomalia.
-                ip = cmd["params"]["ip"]
-                try:
-                    network = MinerNetwork.from_list([ip])
-                    miners = await network.scan()
-                    if not miners:
-                        status, result = "failed", f"No se pudo conectar al minero en {ip}"
-                    else:
-                        await miners[0].reboot()
-                        result = f"Reinicio enviado a {ip}"
-                    log(f"Comando {cmd['id']} (reboot_miner {ip}): {status}")
-                except Exception as e:
-                    status, result = "failed", str(e)
-                    log(f"Error ejecutando comando {cmd['id']} (reboot_miner {ip}): {e}")
-                try:
-                    requests.post(
-                        f"{API_BASE}/agent/commands/{cmd['id']}/ack",
-                        json={"status": status, "result": result},
-                        headers=HEADERS, timeout=10,
-                    )
-                except Exception as e:
-                    log(f"Error confirmando comando {cmd['id']}: {e}")
-                continue
-
-            if relay is not None:
-                ensure_connected(relay)
             try:
-                if relay is None:
-                    status, result = "failed", "No hay un rele de extractores registrado para esta mina"
-                elif cmd["action"] in ("extractor_set_channel", "extractor_set_all"):
-                    try:
-                        _run_relay_command(relay, cmd["action"], cmd["params"])
-                    except Exception as first_err:
-                        # pymodbus no siempre detecta que el rele cerro la conexion de su
-                        # lado (ej. WinError 10054) hasta que se intenta escribir -
-                        # is_connected() puede seguir diciendo "conectado" con un socket
-                        # ya muerto. Se fuerza una reconexion real y se reintenta una vez
-                        # antes de rendirse, en vez de dejar el rele en un estado roto
-                        # hasta el siguiente ciclo de ingest.
-                        log(f"Comando {cmd['id']}: fallo inicial ({first_err}), forzando reconexion al rele...")
-                        relay.close()
-                        relay.connect()
-                        _run_relay_command(relay, cmd["action"], cmd["params"])
-                else:
-                    status, result = "failed", f"accion desconocida: {cmd['action']}"
-                log(f"Comando {cmd['id']} ({cmd['action']}) ejecutado: {status}")
+                await _process_command(cmd)
             except Exception as e:
-                status, result = "failed", str(e)
-                log(f"Error ejecutando comando {cmd['id']}: {e}")
-
-            try:
-                requests.post(
-                    f"{API_BASE}/agent/commands/{cmd['id']}/ack",
-                    json={"status": status, "result": result},
-                    headers=HEADERS, timeout=10,
-                )
-            except Exception as e:
-                log(f"Error confirmando comando {cmd['id']}: {e}")
+                # Una orden mal formada no debe tumbar el ciclo ni quedarse pendiente
+                # bloqueando a las demas.
+                log(f"Error inesperado procesando comando {cmd.get('id')}: {type(e).__name__} {e}")
+                if cmd.get("id") is not None:
+                    _ack(cmd["id"], "failed", f"Error inesperado en el agente: {type(e).__name__} {e}")
+            _last_command_loop_at = time.monotonic()
 
         await asyncio.sleep(COMMAND_POLL_INTERVAL_SECONDS)
 
@@ -995,8 +1074,20 @@ async def main():
     await asyncio.to_thread(_report_location)
     # El rele ya no se conecta al arrancar: se resuelve dinamicamente desde el registro
     # de dispositivos Modbus de la mina (puede no haber ninguno todavia, o cambiar).
+    threading.Thread(target=_scan_watchdog, daemon=True).start()
     await asyncio.gather(ingest_loop(), command_loop(), modbus_status_loop())
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    _process_started_at = time.monotonic()
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        log_update(f"El agente se detuvo por un error inesperado ({type(e).__name__}: {e}) - reiniciando.")
+        if sys.platform == "win32" and getattr(sys, "frozen", False):
+            # Si falla justo al arrancar, se espera antes de relanzar para no quedar en
+            # un ciclo de reinicios cada pocos segundos.
+            if time.monotonic() - _process_started_at < 120:
+                time.sleep(60)
+            _apply_update_and_relaunch()
+        os._exit(1)
